@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+hf/
+results/
+PIANO-PUBBLICAZIONE.md
+kernels/harness/kmc_check
+*.gguf
+*.safetensors

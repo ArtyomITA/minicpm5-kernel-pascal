@@ -1,0 +1,200 @@
+
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -972,7 +972,8 @@
+ template <int DV, int ncols1, int ncols2>
+ void launch_fattn(
+     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
++    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
++    fattn_kernel_t occupancy_kernel = nullptr // KMC TILEQ8: kernel used for the occupancy query (keeps parallel_blocks)
+ ) {
+     constexpr int ncols = ncols1 * ncols2;
+ 
+@@ -1110,7 +1111,8 @@
+ 
+     const dim3 block_dim(warp_size, nwarps, 1);
+     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
+-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
++    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, occupancy_kernel ? occupancy_kernel : fattn_kernel,
++        block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+     GGML_ASSERT(max_blocks_per_sm > 0);
+     int parallel_blocks = max_blocks_per_sm;
+ 
+
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -479,12 +479,69 @@
+     ggml_cuda_unroll<5>{}(load);
+ }
+ 
++// KMC TILEQ8 (H5): load q8_0 K/V rows straight into the FP32 SRAM tile, skipping the q8_0 -> f16 conversion buffer.
++// Every value is produced exactly as conversion + __half22float2 would produce it: float(half(float(q) * float(d))),
++// one round-to-nearest to f16 (convert.cu, generic q8_0 dequantization), so the tile and all math after it are bit-identical.
++// Work item = 8 values of one q8_0 block; q8_0 blocks are 34 bytes, so the quants are read as 16-bit words.
++template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
++static __device__ __forceinline__ void flash_attn_tile_load_tile(
++        const block_q8_0 * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
++    static_assert(J % QK8_0 == 0, "bad J");
++    if constexpr (J == 0) {
++        return; // instantiated for an empty DKQ % nbatch_K remainder that never runs
++    } else {
++    constexpr int nsub   = QK8_0/8;
++    constexpr int nitems = I*(J/QK8_0)*nsub;
++    const int tid = threadIdx.y*warp_size + threadIdx.x;
++
++#pragma unroll
++    for (int n0 = 0; n0 < nitems; n0 += nwarps*warp_size) {
++        const int n = n0 + tid;
++        if (n0 + nwarps*warp_size > nitems && n >= nitems) {
++            break;
++        }
++        const int i  = n / ((J/QK8_0)*nsub);
++        const int jb = (n / nsub) % (J/QK8_0);
++        const int s  = n % nsub;
++
++        __align__(16) float tmp[8];
++        if (!oob_check || i < i_sup) {
++            const block_q8_0 * b = KV + int64_t(i)*stride_KV + jb;
++            const float d = __half2float(b->d);
++            const uint16_t * q16 = (const uint16_t *) (b->qs + 8*s);
++#pragma unroll
++            for (int l = 0; l < 4; ++l) {
++                const uint16_t v = q16[l];
++                tmp[2*l + 0] = __half2float(__float2half_rn(float((int8_t) (v & 0xFF)) * d));
++                tmp[2*l + 1] = __half2float(__float2half_rn(float((int8_t) (v >>   8)) * d));
++            }
++        } else {
++#pragma unroll
++            for (int l = 0; l < 8; ++l) {
++                tmp[l] = 0.0f;
++            }
++        }
++        // Pascal: max copy 8 bytes and the K tile rows are J + 2 floats long, so only 8-byte alignment is guaranteed
++        constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
++        float * dst = tile_KV + i*(J + J_padding) + jb*QK8_0 + 8*s;
++#pragma unroll
++        for (int l = 0; l < 8; l += cpy_nb/4) {
++            ggml_cuda_memcpy_1<cpy_nb>(dst + l, tmp + l);
++        }
++    }
++    }
++}
++
++template <typename T_KV> static constexpr __device__ int fattn_tile_kv_ne() {
++    return std::is_same_v<T_KV, block_q8_0> ? QK8_0 : 2; // values per pointer step: q8_0 block or half2
++}
++
+ // Function that performs a single iteration in for the KQ matrix multiplication:
+ template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int nbatch_fa, int nbatch_K,
+-    bool use_logit_softcap, bool oob_check, typename T_vec_dot>
++    bool use_logit_softcap, bool oob_check, typename T_vec_dot, typename T_KV>
+ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
+         T_vec_dot   * const Q_tmp,
+-        const half2 * const __restrict__ K_h2,
++        const T_KV  * const __restrict__ K_h2,
+         T_vec_dot   * const KV_tmp,
+         const int stride_K2,
+         const int k_VKQ_0,
+@@ -499,7 +556,7 @@
+     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
+ 
+     flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
+-        (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
++        (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/fattn_tile_kv_ne<T_KV>(), KV_tmp, stride_K2, k_VKQ_sup);
+     __syncthreads();
+ 
+ #ifdef FAST_FP16_AVAILABLE
+@@ -556,11 +613,11 @@
+ 
+ // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
+ template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
+-    bool use_logit_softcap, bool oob_check, typename T_vec_dot, typename T_KQ, typename T_acc>
++    bool use_logit_softcap, bool oob_check, typename T_vec_dot, typename T_KQ, typename T_acc, typename T_KV>
+ static __device__ __forceinline__ void flash_attn_tile_iter(
+         T_vec_dot * const Q_tmp,
+-        const half2 * const __restrict__ K_h2,
+-        const half2 * const __restrict__ V_h2,
++        const T_KV * const __restrict__ K_h2,
++        const T_KV * const __restrict__ V_h2,
+         const half  * const __restrict__ mask,
+         const uint3 ne01,
+         const float logit_softcap,
+@@ -788,7 +845,7 @@
+     }
+ }
+ 
+-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap> // D == head size
++template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool kv_q8 = false> // D == head size
+ __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
+ static __global__ void flash_attn_tile(
+         const char * Q_ptr,
+@@ -824,7 +881,12 @@
+ 
+     // Skip unused kernel variants for faster compilation:
+ 
+-    if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))) {
++#ifdef FAST_FP16_AVAILABLE
++    constexpr bool kv_q8_direct = false; // KMC TILEQ8 exists only for the FP32 tile (sm_61); the host never selects it here
++#else
++    constexpr bool kv_q8_direct = kv_q8;
++#endif // FAST_FP16_AVAILABLE
++    if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512)) || (kv_q8 && !kv_q8_direct)) {
+         GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+             max_bias, m0, m1, n_head_log2, logit_softcap,
+             ne00, ne01, ne02, ne03,
+@@ -854,13 +916,14 @@
+     const int head0 = blockIdx.z*ncols2 - sequence*ne02; // == blockIdx.z % (ne02/ncols2)
+     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+     const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
+-    const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
+-    const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
++    using T_KV = std::conditional_t<kv_q8_direct, block_q8_0, half2>;
++    const T_KV * K_h2 = (const T_KV *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
++    const T_KV * V_h2 = (const T_KV *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
+ 
+     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
+ 
+-    const int stride_K2   = nb11 / sizeof(half2);
+-    const int stride_V2   = nb21 / sizeof(half2);
++    const int stride_K2   = nb11 / sizeof(T_KV);
++    const int stride_V2   = nb21 / sizeof(T_KV);
+     const int stride_mask = nb31 / sizeof(half);
+ 
+     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, head0, n_head_log2, m0, m1) : 1.0f;
+@@ -1145,6 +1208,18 @@
+ #endif // FLASH_ATTN_AVAILABLE
+ }
+ 
++// KMC TILEQ8 (H5) dispatch: GTX 10x0 (cc 6.1) only, q8_0 K and V, head size 128, whole q8_0 blocks per row.
++// Valve: GGML_CUDA_DISABLE_KMC_TILEQ8 (any value) keeps the q8_0 -> f16 conversion path.
++static bool ggml_cuda_fattn_tile_q8_direct(const ggml_tensor * dst, const int cc) {
++    static const bool enabled = getenv("GGML_CUDA_DISABLE_KMC_TILEQ8") == nullptr;
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++    return enabled && cc == 610 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
++        K->ne[0] == 128 && V->ne[0] == 128 && K->nb[0] == sizeof(block_q8_0) && V->nb[0] == sizeof(block_q8_0) &&
++        K->nb[1] % sizeof(block_q8_0) == 0 && K->nb[2] % sizeof(block_q8_0) == 0 && K->nb[3] % sizeof(block_q8_0) == 0 &&
++        V->nb[1] % sizeof(block_q8_0) == 0 && V->nb[2] % sizeof(block_q8_0) == 0 && V->nb[3] % sizeof(block_q8_0) == 0;
++}
++
+ template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
+ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * Q = dst->src[0];
+@@ -1178,6 +1253,16 @@
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
++            if constexpr (DKQ == 128 && DV == 128 && ncols2 == 8) {
++                if (ggml_cuda_fattn_tile_q8_direct(dst, cc)) {
++                    // KMC TILEQ8 (H5): same kernel reading q8_0 K/V directly, no f16 conversion buffers. The f16 kernel
++                    // is passed for the occupancy query so parallel_blocks (KV split, combine order) stays the same.
++                    fattn_kernel_t fattn_kernel_q8 = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, true>;
++                    launch_fattn<DV, cols_per_block/ncols2, ncols2>
++                        (ctx, dst, fattn_kernel_q8, nwarps, nbytes_shared, nbatch_fa, false, false, false, warp_size, fattn_kernel);
++                    return;
++                }
++            }
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, warp_size);
+             return;
