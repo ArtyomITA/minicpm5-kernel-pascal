@@ -15,7 +15,8 @@ changes numbers.
 | 4 | **FR-Spec** draft, 32k vocabulary ([on Hugging Face](https://huggingface.co/adriandj3/MiniCPM5-2B-DSpark-FRSpec32k-GGUF)) | +4.7% | English agent replay, 24 turns, fixed seed | same output distribution |
 | **total** | | **83.5 tok/s**, 31.9 ms per speculative step | English agent replay | |
 
-General notes on what helps and what does not on Pascal (build flags, CUDA graphs, slots, HAGS, thermals): [PASCAL-NOTES.md](PASCAL-NOTES.md).
+General notes on what helps and what does not on Pascal (build flags, CUDA graphs, slots, HAGS, thermals): [PASCAL-NOTES.md](PASCAL-NOTES.md). Full-parameter fine-tuning of the
+same model on the same 8 GB card, 354 to 531 tokens/s with identical losses: [TRAINING-8GB.md](TRAINING-8GB.md).
 
 Prefill on an 8k prompt: 1264 tok/s. VRAM: 6.4 GB of 8 with a 49k context.
 
