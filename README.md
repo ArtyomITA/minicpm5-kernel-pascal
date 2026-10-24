@@ -15,6 +15,8 @@ changes numbers.
 | 4 | **FR-Spec** draft, 32k vocabulary ([on Hugging Face](https://huggingface.co/adriandj3/MiniCPM5-2B-DSpark-FRSpec32k-GGUF)) | +4.7% | English agent replay, 24 turns, fixed seed | same output distribution |
 | **total** | | **83.5 tok/s**, 31.9 ms per speculative step | English agent replay | |
 
+General notes on what helps and what does not on Pascal (build flags, CUDA graphs, slots, HAGS, thermals): [PASCAL-NOTES.md](PASCAL-NOTES.md).
+
 Prefill on an 8k prompt: 1264 tok/s. VRAM: 6.4 GB of 8 with a 49k context.
 
 Bonus, for agents that need fast decisions: [pjev-2b as a LoRA](https://huggingface.co/adriandj3/MiniCPM5-2B-pjev-LoRA)
