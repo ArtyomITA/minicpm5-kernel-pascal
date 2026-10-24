@@ -20,7 +20,8 @@ General notes on what helps and what does not on Pascal (build flags, CUDA graph
 Prefill on an 8k prompt: 1264 tok/s. VRAM: 6.4 GB of 8 with a 49k context.
 
 Bonus, for agents that need fast decisions: [pjev-2b as a LoRA](https://huggingface.co/adriandj3/MiniCPM5-2B-pjev-LoRA)
-over the same MiniCPM5-2B, 93.5% on 62 held-out agent decisions in 0.22 s, for about 200 MB of VRAM.
+over the same MiniCPM5-2B, 93.5% on 62 held-out agent decisions in 0.22 s, for about 200 MB of VRAM. How I got there, and the calibration
+trick that helps any small model at zero cost: [FAST-DECISIONS.md](FAST-DECISIONS.md).
 
 ## The recipe
 
